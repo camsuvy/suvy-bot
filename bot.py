@@ -43,6 +43,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # { guild_id: { user_id: { "pending": bool, "ping_msg_id": int, "next_ping": float, "shift": str, "stats": {...} } } }
 chatter_state = {}
 shift_totals = {}   # { guild_id: { shift: { ppv, revenue, checkins } } }
+weekly_stats = {}  # { guild_id: { user_id: { name, ppv, revenue, checkins } } }
 
 def get_state(guild_id, user_id):
     if guild_id not in chatter_state:
@@ -66,6 +67,15 @@ def get_shift_totals(guild_id, shift):
     if shift not in shift_totals[guild_id]:
         shift_totals[guild_id][shift] = {"ppv": 0, "revenue": 0.0, "checkins": 0}
     return shift_totals[guild_id][shift]
+
+def get_weekly_stats(guild_id, user_id, name=""):
+    if guild_id not in weekly_stats:
+        weekly_stats[guild_id] = {}
+    if user_id not in weekly_stats[guild_id]:
+        weekly_stats[guild_id][user_id] = {"name": name, "ppv": 0, "revenue": 0.0, "checkins": 0}
+    if name:
+        weekly_stats[guild_id][user_id]["name"] = name
+    return weekly_stats[guild_id][user_id]
 
 def random_interval():
     return random.randint(MIN_INTERVAL, MAX_INTERVAL)
@@ -126,6 +136,12 @@ async def on_message(message):
         totals["ppv"] += ppv
         totals["revenue"] += rev
         totals["checkins"] += 1
+
+        # Update weekly leaderboard
+        w = get_weekly_stats(guild.id, user_id, message.author.display_name)
+        w["ppv"] += ppv
+        w["revenue"] += rev
+        w["checkins"] += 1
 
         await message.add_reaction("✅")
 
@@ -269,7 +285,8 @@ async def start_shift(ctx, member: discord.Member, shift_key: str = None):
     if shift_ch:
         await shift_ch.send(
             f"👋 {member.mention} Your shift has started! Stay active — you'll receive random check-in pings.\n"
-            f"When pinged, reply with: `PPV: X | Fans: X | Rev: $X`"
+            f"When pinged, reply with: `PPV: X | Fans: X | Rev: $X`\n"
+            f"📺 **Join the {SHIFTS[shift_key]['name']} voice channel and share your screen now.**"
         )
 
 @bot.command(name="endshift")
@@ -290,10 +307,22 @@ async def end_shift(ctx, member: discord.Member):
     embed.add_field(name="Total Revenue", value=f"${totals['revenue']:.2f}", inline=True)
     await ctx.send(embed=embed)
 
-    # Log to stats
+    # Post daily summary to stats-log
     log_ch = await get_log_channel(ctx.guild)
     if log_ch:
-        await log_ch.send(embed=embed)
+        summary = discord.Embed(
+            title=f"📋 Daily Shift Summary — {member.display_name}",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc)
+        )
+        summary.add_field(name="Shift", value=SHIFTS.get(shift_key, {}).get("name", "—"), inline=True)
+        summary.add_field(name="Check-ins", value=str(totals["checkins"]), inline=True)
+        summary.add_field(name="PPVs Sent", value=str(totals["ppv"]), inline=True)
+        summary.add_field(name="Revenue", value=f"${totals['revenue']:.2f}", inline=True)
+        avg_rev = totals["revenue"] / totals["checkins"] if totals["checkins"] > 0 else 0
+        summary.add_field(name="Avg Rev/Check-in", value=f"${avg_rev:.2f}", inline=True)
+        summary.set_footer(text="Shift complete")
+        await log_ch.send(embed=summary)
 
 @bot.command(name="status")
 async def status(ctx):
@@ -329,6 +358,42 @@ async def status(ctx):
 
     await ctx.send(embed=embed)
 
+@bot.command(name="leaderboard")
+async def leaderboard(ctx):
+    """Show weekly leaderboard. Usage: !leaderboard"""
+    if ctx.guild.id not in weekly_stats or not weekly_stats[ctx.guild.id]:
+        await ctx.send("No weekly stats yet. Stats build up as chatters complete check-ins.")
+        return
+
+    sorted_chatters = sorted(
+        weekly_stats[ctx.guild.id].items(),
+        key=lambda x: x[1]["revenue"],
+        reverse=True
+    )
+
+    embed = discord.Embed(title="🏆 Weekly Leaderboard", color=0xFFD700,
+                          timestamp=datetime.now(timezone.utc))
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (user_id, stats) in enumerate(sorted_chatters[:10]):
+        medal = medals[i] if i < 3 else f"#{i+1}"
+        embed.add_field(
+            name=f"{medal} {stats['name']}",
+            value=f"💰 ${stats['revenue']:.2f} | 📨 {stats['ppv']} PPVs | ✅ {stats['checkins']} check-ins",
+            inline=False
+        )
+
+    embed.set_footer(text="Resets with !resetweekly")
+    await ctx.send(embed=embed)
+
+@bot.command(name="resetweekly")
+@commands.has_permissions(administrator=True)
+async def reset_weekly(ctx):
+    """Reset weekly leaderboard stats."""
+    if ctx.guild.id in weekly_stats:
+        weekly_stats[ctx.guild.id] = {}
+    await ctx.send("✅ Weekly leaderboard has been reset.")
+
 @bot.command(name="shiftreport")
 async def shift_report(ctx, shift_key: str = None):
     """Show stats for a shift. Usage: !shiftreport night"""
@@ -361,6 +426,8 @@ async def help_cmd(ctx):
     embed.add_field(name="!endshift @user", value="End a chatter's shift + show summary", inline=False)
     embed.add_field(name="!status", value="See all active chatters and their status", inline=False)
     embed.add_field(name="!shiftreport [night/morning/day]", value="Show total stats for a shift", inline=False)
+    embed.add_field(name="!leaderboard", value="Show weekly top chatters by revenue", inline=False)
+    embed.add_field(name="!resetweekly", value="Reset the weekly leaderboard (admin only)", inline=False)
     embed.add_field(name="!resetstats [night/morning/day]", value="Reset stats for a shift (admin only)", inline=False)
     embed.add_field(name="─────────────────────────", value="**Chatter check-in format:**\n`PPV: 5 | Fans: 12 | Rev: $180`\nor just: `5 12 180`", inline=False)
     await ctx.send(embed=embed)
