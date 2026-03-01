@@ -37,7 +37,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
 # { guild_id: { user_id: { "pending": bool, "ping_msg_id": int, "next_ping": float, "shift": str, "stats": {...} } } }
