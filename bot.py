@@ -50,6 +50,8 @@ roster = {}  # { guild_id: { shift_key: [ user_id, ... ] } }  — expected chatt
 strikes = {}  # { guild_id: { user_id: { count, reasons: [] } } }
 daily_goal = {}  # { guild_id: { goal: float, current: float, date: str } }
 model_weekly_goal = 5000.0  # Default $5k per model per week (Mon-Sat)
+milestones_hit = {}  # { guild_id: { model_name: [milestones already celebrated] } }
+REVENUE_MILESTONES = [500, 1000, 2500, 5000, 7500, 10000, 15000, 20000]
 models = {}  # { guild_id: { model_name: { chatters: [user_id], revenue: float, ppv: int } } }
 chatter_model = {}  # { guild_id: { user_id: model_name } }
 
@@ -222,6 +224,53 @@ async def on_message(message):
             m = get_model(guild.id, assigned_model)
             m["revenue"] += rev
             m["ppv"] += ppv
+
+            # Check revenue milestones
+            if guild.id not in milestones_hit:
+                milestones_hit[guild.id] = {}
+            if assigned_model not in milestones_hit[guild.id]:
+                milestones_hit[guild.id][assigned_model] = []
+
+            total_model_rev = m["revenue"]
+            for milestone in REVENUE_MILESTONES:
+                if total_model_rev >= milestone and milestone not in milestones_hit[guild.id][assigned_model]:
+                    milestones_hit[guild.id][assigned_model].append(milestone)
+
+                    # Pick celebration message
+                    if milestone >= 10000:
+                        emoji = "🏆💰🎉"
+                        msg = f"INCREDIBLE"
+                    elif milestone >= 5000:
+                        emoji = "🔥💵🔥"
+                        msg = "AMAZING"
+                    else:
+                        emoji = "🎯💰"
+                        msg = "LET'S GO"
+
+                    celebration = (
+                        f"{emoji} **{msg}! {assigned_model} just hit ${milestone:,}!** {emoji}\n"
+                        f"Total revenue: **${total_model_rev:,.2f}**\n"
+                        f"Keep pushing! 💪"
+                    )
+
+                    # Post in all shift channels
+                    for ch_name in SHIFT_CHANNELS:
+                        ch = await get_channel(guild, ch_name)
+                        if ch:
+                            await ch.send(celebration)
+
+                    # Post in stats-log
+                    log_ch = await get_log_channel(guild)
+                    if log_ch:
+                        await log_ch.send(celebration)
+
+                    # DM owner
+                    owner = guild.get_member(OWNER_ID)
+                    if owner:
+                        try:
+                            await owner.send(f"🏆 **{assigned_model}** just hit **${milestone:,}** in total revenue!")
+                        except:
+                            pass
 
         # Update chatter daily revenue
         cd = get_chatter_daily(guild.id, user_id)
@@ -532,6 +581,41 @@ async def monitor_loop():
 
             current = now_ts()
 
+            # Auto-strike if chatter hasn't ended shift 5 min after shift end time
+            shift_key_active = state.get("shift")
+            if shift_key_active and shift_key_active in SHIFTS:
+                end_hour = SHIFTS[shift_key_active]["end"]
+                # Calculate minutes past shift end
+                mins_past_end = 0
+                if now.hour == end_hour and now.minute >= 5:
+                    mins_past_end = now.minute
+                elif now.hour > end_hour:
+                    mins_past_end = (now.hour - end_hour) * 60 + now.minute
+
+                if mins_past_end >= 15 and not state.get("end_strike_sent") and not state.get("active_sale"):
+                    member = guild.get_member(user_id)
+                    if member:
+                        # Find next shift
+                        next_shift_map = {"night": "morning", "morning": "day", "day": "night"}
+                        next_shift = SHIFTS[next_shift_map[shift_key_active]]["name"]
+                        try:
+                            await member.send(
+                                f"⏰ **Your shift has ended — please wrap up!**\n"
+                                f"Your {SHIFTS[shift_key_active]['name']} ended 15 minutes ago.\n"
+                                f"**{next_shift}** chatter may be waiting to start.\n"
+                                f"Type `!endshift @{member.display_name}` in your shift channel now."
+                            )
+                        except:
+                            pass
+                        # Also ping them in shift channel
+                        ch_name = next((k for k, v in SHIFT_CHANNELS.items() if v == shift_key_active), None)
+                        shift_ch = await get_channel(guild, ch_name) if ch_name else None
+                        if shift_ch:
+                            await shift_ch.send(
+                                f"⏰ {member.mention} Your shift ended 15 minutes ago. "
+                                f"Please type `!endshift @{member.display_name}` so the next chatter can start."
+                            )
+
             # Time to send a ping?
             if not state["pending"] and state.get("next_ping") and current >= state["next_ping"]:
                 shift_key = state.get("shift")
@@ -604,11 +688,21 @@ async def monitor_loop():
 # ─── COMMANDS ──────────────────────────────────────────────────────────────────
 
 @bot.command(name="startshift")
-@commands.has_permissions(manage_messages=True)
-async def start_shift(ctx, member: discord.Member, shift_key: str = None):
-    """Start monitoring a chatter. Usage: !startshift @username night"""
+async def start_shift(ctx, member: discord.Member = None, shift_key: str = None):
+    """Start your shift. Usage: !startshift @yourname night"""
+    # If no member specified, assume themselves
+    if member is None:
+        member = ctx.author
+        await ctx.send("❌ Usage: `!startshift @yourname night` (options: night, morning, day)")
+        return
+
+    # Chatters can only start their OWN shift
+    if not ctx.author.guild_permissions.manage_messages and ctx.author.id != member.id:
+        await ctx.send("❌ You can only start your own shift.")
+        return
+
     if not shift_key or shift_key not in SHIFTS:
-        await ctx.send(f"❌ Specify a shift: `!startshift @user night` (options: night, morning, day)")
+        await ctx.send("❌ Specify a shift: `!startshift @yourname night` (options: night, morning, day)")
         return
 
     # Check if shift slot is already taken for this model
@@ -618,11 +712,23 @@ async def start_shift(ctx, member: discord.Member, shift_key: str = None):
         current_slot = models[ctx.guild.id][assigned_model].get("active_slot")
         if current_slot == slot_key:
             for uid, s in chatter_state.get(ctx.guild.id, {}).items():
-                if s.get("active") and s.get("shift") == shift_key and get_chatter_model(ctx.guild.id, uid) == assigned_model:
+                if s.get("active") and s.get("shift") == shift_key and get_chatter_model(ctx.guild.id, uid) == assigned_model and uid != member.id:
                     existing = ctx.guild.get_member(uid)
                     name = existing.display_name if existing else "Someone"
-                    await ctx.send(f"❌ **{name}** is already working the {SHIFTS[shift_key]['name']} for **{assigned_model}**. Only one chatter per shift per model.")
-                    return
+                    # Check if previous chatter is past their shift end time
+                    end_hour = SHIFTS[shift_key]["end"]
+                    now_check = datetime.now(timezone.utc)
+                    past_end = now_check.hour > end_hour or (now_check.hour == end_hour and now_check.minute >= 0)
+                    if not past_end:
+                        await ctx.send(f"❌ **{name}** is already working the {SHIFTS[shift_key]['name']} for **{assigned_model}**. Only one chatter per shift per model.")
+                        return
+                    else:
+                        # Auto-end previous chatter's shift silently
+                        s["active"] = False
+                        s["pending"] = False
+                        log_ch = await get_log_channel(ctx.guild)
+                        if log_ch:
+                            await log_ch.send(f"🔄 **{name}**'s shift auto-ended — **{member.display_name}** has taken over the {SHIFTS[shift_key]['name']} for **{assigned_model}**.")
         models[ctx.guild.id][assigned_model]["active_slot"] = slot_key
 
     state = get_state(ctx.guild.id, member.id)
@@ -632,6 +738,8 @@ async def start_shift(ctx, member: discord.Member, shift_key: str = None):
     state["pending"] = False
     state["alert_sent"] = False
     state["warning_sent"] = False
+    state["end_strike_sent"] = False
+    state["active_sale"] = False
     state["shift_start_ts"] = now_ts()
     next_in = random_interval()
     state["next_ping"] = now_ts() + next_in
@@ -644,32 +752,47 @@ async def start_shift(ctx, member: discord.Member, shift_key: str = None):
     embed.add_field(name="Hours", value=SHIFTS[shift_key]["hours"], inline=True)
     embed.add_field(name="First ping in", value=f"~{next_in // 60} min (random)", inline=True)
 
-    # Auto-detect if they're late
+    # Auto-detect if they're late (3 min grace period)
     now = datetime.now(timezone.utc)
     shift_start_hour = SHIFTS[shift_key]["start"]
     current_hour = now.hour
-    # Calculate minutes late (handle overnight shifts)
     minutes_late = 0
     if current_hour >= shift_start_hour:
         minutes_late = (current_hour - shift_start_hour) * 60 + now.minute
-    elif shift_key == "night" and current_hour < 3:  # night shift crosses midnight
+    elif shift_key == "night" and current_hour < 3:
         minutes_late = (current_hour + 24 - shift_start_hour) * 60 + now.minute
 
-    if minutes_late >= 5:
+    if minutes_late > 3:
         embed.add_field(name="⚠️ Late", value=f"{minutes_late} minutes past shift start", inline=False)
         embed.color = 0xffaa00
+
+        # Auto strike
+        s = get_strikes(ctx.guild.id, member.id)
+        s["count"] += 1
+        s["reasons"].append(f"Strike {s['count']}: Late shift start by {minutes_late} min ({SHIFTS[shift_key]['name']})")
+
+        # DM chatter
+        try:
+            await member.send(
+                f"⚠️ **Strike {s['count']}/3 — Suvy Agency**\n"
+                f"You started your {SHIFTS[shift_key]['name']} **{minutes_late} minutes late.**\n"
+                f"You have a 3 minute grace period. Please be on time next shift."
+            )
+        except:
+            pass
+
         log_ch = await get_log_channel(ctx.guild)
         if log_ch:
             await log_ch.send(
-                f"⏰ **{member.display_name}** started their shift **{minutes_late} minutes late** "
-                f"({SHIFTS[shift_key]['name']})"
+                f"⏰ **{member.display_name}** started {minutes_late} min late ({SHIFTS[shift_key]['name']}) "
+                f"— Strike {s['count']}/3 issued automatically."
             )
         owner = ctx.guild.get_member(OWNER_ID)
         if owner and owner.id != ctx.author.id:
             try:
                 await owner.send(
-                    f"⏰ **{member.display_name}** just started their shift {minutes_late} minutes late.\n"
-                    f"Shift: {SHIFTS[shift_key]['name']}"
+                    f"⏰ **{member.display_name}** started their shift {minutes_late} minutes late.\n"
+                    f"Shift: {SHIFTS[shift_key]['name']} | Strike {s['count']}/3 issued automatically."
                 )
             except:
                 pass
@@ -1214,6 +1337,154 @@ async def performance(ctx):
 
     embed.set_footer(text="A=90%+ | B=70%+ | C=50%+ | D=Below 50% of weekly goal")
     await ctx.send(embed=embed)
+
+@bot.command(name="milestones")
+async def show_milestones(ctx):
+    """Show revenue milestone progress for all models."""
+    if ctx.guild.id not in models or not models[ctx.guild.id]:
+        await ctx.send("No models set up yet.")
+        return
+
+    embed = discord.Embed(title="🏆 Revenue Milestones", color=0xFFD700,
+                          timestamp=datetime.now(timezone.utc))
+
+    for model_name, data in models[ctx.guild.id].items():
+        total = data.get("revenue", 0)
+        hit = milestones_hit.get(ctx.guild.id, {}).get(model_name, [])
+
+        # Find next milestone
+        next_milestone = next((m for m in REVENUE_MILESTONES if m > total), None)
+        remaining = f"${next_milestone - total:,.2f} until ${next_milestone:,}" if next_milestone else "All milestones hit! 🏆"
+
+        milestone_line = ""
+        for m in REVENUE_MILESTONES:
+            if m in hit:
+                milestone_line += f"✅ ${m:,}  "
+            elif m == next_milestone:
+                pct = min(100, (total / m) * 100)
+                milestone_line += f"🔜 ${m:,} ({pct:.0f}%)  "
+            else:
+                milestone_line += f"⬜ ${m:,}  "
+
+        embed.add_field(
+            name=f"📌 {model_name} — ${total:,.2f} total",
+            value=f"{milestone_line}\n📍 {remaining}",
+            inline=False
+        )
+
+    await ctx.send(embed=embed)
+
+@bot.command(name="resetmilestones")
+@commands.has_permissions(administrator=True)
+async def reset_milestones(ctx, *, model_name: str):
+    """Reset milestones for a model. Usage: !resetmilestones Mia"""
+    if ctx.guild.id in milestones_hit and model_name in milestones_hit[ctx.guild.id]:
+        milestones_hit[ctx.guild.id][model_name] = []
+    await ctx.send(f"✅ Milestones reset for **{model_name}**.")
+
+@bot.command(name="swapshift")
+@commands.has_permissions(manage_messages=True)
+async def swap_shift(ctx, chatter1: discord.Member, chatter2: discord.Member):
+    """Swap two chatters' assigned shifts. Usage: !swapshift @chatter1 @chatter2"""
+    if ctx.guild.id not in roster:
+        await ctx.send("❌ No roster set up yet.")
+        return
+
+    # Find each chatter's current shift in roster
+    shift1 = next((sk for sk, uids in roster[ctx.guild.id].items() if chatter1.id in uids), None)
+    shift2 = next((sk for sk, uids in roster[ctx.guild.id].items() if chatter2.id in uids), None)
+
+    if not shift1 or not shift2:
+        await ctx.send("❌ Both chatters must be on the roster to swap. Use `!addtoroster` first.")
+        return
+
+    # Swap in roster
+    roster[ctx.guild.id][shift1].remove(chatter1.id)
+    roster[ctx.guild.id][shift2].remove(chatter2.id)
+    roster[ctx.guild.id][shift1].append(chatter2.id)
+    roster[ctx.guild.id][shift2].append(chatter1.id)
+
+    embed = discord.Embed(title="🔄 Shift Swap Confirmed", color=0x00ff88)
+    embed.add_field(name=chatter1.display_name, value=f"{SHIFTS[shift1]['name']} → {SHIFTS[shift2]['name']}", inline=True)
+    embed.add_field(name=chatter2.display_name, value=f"{SHIFTS[shift2]['name']} → {SHIFTS[shift1]['name']}", inline=True)
+    await ctx.send(embed=embed)
+
+    for member, old, new in [(chatter1, shift1, shift2), (chatter2, shift2, shift1)]:
+        try:
+            await member.send(
+                f"🔄 **Shift Swap — Suvy Agency**\n"
+                f"Old: {SHIFTS[old]['name']} ({SHIFTS[old]['hours']})\n"
+                f"New: {SHIFTS[new]['name']} ({SHIFTS[new]['hours']})\n"
+                f"Be on time for your new shift."
+            )
+        except:
+            pass
+
+    log_ch = await get_log_channel(ctx.guild)
+    if log_ch:
+        await log_ch.send(embed=embed)
+
+@bot.command(name="doubleshift")
+@commands.has_permissions(manage_messages=True)
+async def double_shift(ctx, member: discord.Member, shift1: str, shift2: str):
+    """Approve a chatter to cover two shifts. Usage: !doubleshift @user night morning"""
+    if shift1 not in SHIFTS or shift2 not in SHIFTS:
+        await ctx.send("❌ Options: night, morning, day")
+        return
+
+    if ctx.guild.id not in roster:
+        roster[ctx.guild.id] = {}
+    for sk in [shift1, shift2]:
+        if sk not in roster[ctx.guild.id]:
+            roster[ctx.guild.id][sk] = []
+        if member.id not in roster[ctx.guild.id][sk]:
+            roster[ctx.guild.id][sk].append(member.id)
+
+    embed = discord.Embed(title=f"⚡ Double Shift — {member.display_name}", color=0xFFD700)
+    embed.add_field(name="Shift 1", value=f"{SHIFTS[shift1]['name']} ({SHIFTS[shift1]['hours']})", inline=True)
+    embed.add_field(name="Shift 2", value=f"{SHIFTS[shift2]['name']} ({SHIFTS[shift2]['hours']})", inline=True)
+    embed.add_field(name="Pay", value="All hours tracked automatically", inline=False)
+    await ctx.send(embed=embed)
+
+    try:
+        await member.send(
+            f"⚡ **Double Shift Approved — Suvy Agency**\n"
+            f"1. {SHIFTS[shift1]['name']} ({SHIFTS[shift1]['hours']})\n"
+            f"2. {SHIFTS[shift2]['name']} ({SHIFTS[shift2]['hours']})\n"
+            f"Start each shift normally with `!startshift @{member.display_name} [shift]`"
+        )
+    except:
+        pass
+
+    log_ch = await get_log_channel(ctx.guild)
+    if log_ch:
+        await log_ch.send(embed=embed)
+
+@bot.command(name="activesale")
+async def active_sale(ctx):
+    """Tell the bot you're closing a sale past shift end. Usage: !activesale"""
+    state = get_state(ctx.guild.id, ctx.author.id)
+    if not state.get("active"):
+        await ctx.send("❌ You don't have an active shift.")
+        return
+
+    state["active_sale"] = True
+    state["end_strike_sent"] = False
+
+    await ctx.send(
+        f"✅ {ctx.author.mention} Active sale noted — no warnings will be sent.\n"
+        f"Type `!endshift @{ctx.author.display_name}` when you're done."
+    )
+
+    owner = ctx.guild.get_member(OWNER_ID)
+    if owner:
+        try:
+            await owner.send(
+                f"💰 **{ctx.author.display_name}** is staying past their shift to close a sale.\n"
+                f"Shift: {SHIFTS.get(state.get('shift',''), {}).get('name', '')}"
+            )
+        except:
+            pass
 
 @bot.command(name="addtoroster")
 @commands.has_permissions(manage_messages=True)
