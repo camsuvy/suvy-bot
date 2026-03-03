@@ -6,6 +6,13 @@ import os
 import json
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+import pytz
+
+AGENCY_TZ = pytz.timezone("America/New_York")  # Eastern Time
+
+def now_eastern():
+    """Get current time in Eastern timezone."""
+    return datetime.now(AGENCY_TZ)
 
 load_dotenv()
 
@@ -95,7 +102,7 @@ def get_strikes(guild_id, user_id):
     return strikes[guild_id][user_id]
 
 def get_daily_goal(guild_id):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = now_eastern().strftime("%Y-%m-%d")
     if guild_id not in daily_goal:
         daily_goal[guild_id] = {"goal": 0.0, "current": 0.0, "date": today}
     # Reset if new day
@@ -105,7 +112,7 @@ def get_daily_goal(guild_id):
     return daily_goal[guild_id]
 
 def get_chatter_daily(guild_id, user_id):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = now_eastern().strftime("%Y-%m-%d")
     if guild_id not in chatter_daily:
         chatter_daily[guild_id] = {}
     if user_id not in chatter_daily[guild_id] or chatter_daily[guild_id][user_id]["date"] != today:
@@ -147,7 +154,7 @@ def random_interval():
     return random.randint(MIN_INTERVAL, MAX_INTERVAL)
 
 def now_ts():
-    return datetime.now(timezone.utc).timestamp()
+    return now_eastern().timestamp()
 
 def fmt_time(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%I:%M %p UTC")
@@ -417,7 +424,7 @@ def parse_stats(text):
 async def monitor_loop():
     for guild in bot.guilds:
         # Check roster for no-shows (15 min after shift start) — Monday to Saturday only
-        now = datetime.now(timezone.utc)
+        now = now_eastern()
         if now.weekday() < 6:  # 0=Monday, 5=Saturday, 6=Sunday (skip Sunday)
             for shift_key, shift_info in SHIFTS.items():
                 start_hour = shift_info["start"]
@@ -717,7 +724,7 @@ async def start_shift(ctx, member: discord.Member = None, shift_key: str = None)
                     name = existing.display_name if existing else "Someone"
                     # Check if previous chatter is past their shift end time
                     end_hour = SHIFTS[shift_key]["end"]
-                    now_check = datetime.now(timezone.utc)
+                    now_check = now_eastern()
                     past_end = now_check.hour > end_hour or (now_check.hour == end_hour and now_check.minute >= 0)
                     if not past_end:
                         await ctx.send(f"❌ **{name}** is already working the {SHIFTS[shift_key]['name']} for **{assigned_model}**. Only one chatter per shift per model.")
@@ -753,7 +760,7 @@ async def start_shift(ctx, member: discord.Member = None, shift_key: str = None)
     embed.add_field(name="First ping in", value=f"~{next_in // 60} min (random)", inline=True)
 
     # Auto-detect if they're late (3 min grace period)
-    now = datetime.now(timezone.utc)
+    now = now_eastern()
     shift_start_hour = SHIFTS[shift_key]["start"]
     current_hour = now.hour
     minutes_late = 0
@@ -859,7 +866,7 @@ async def end_shift(ctx, member: discord.Member = None):
         summary = discord.Embed(
             title=f"📋 Daily Shift Summary — {member.display_name}",
             color=0x5865F2,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=now_eastern()
         )
         summary.add_field(name="Shift", value=SHIFTS.get(shift_key, {}).get("name", "—"), inline=True)
         summary.add_field(name="Check-ins", value=str(totals["checkins"]), inline=True)
@@ -1152,7 +1159,7 @@ async def check_goal(ctx):
     bar = "🟩" * filled + "⬛" * (10 - filled)
 
     embed = discord.Embed(title="🎯 Daily Revenue Goals", color=0x00ff88,
-                          timestamp=datetime.now(timezone.utc))
+                          timestamp=now_eastern())
 
     # Overall
     embed.add_field(
@@ -1244,7 +1251,7 @@ async def pay(ctx):
     embed = discord.Embed(
         title="💸 Weekly Payout Sheet",
         color=0xFFD700,
-        timestamp=datetime.now(timezone.utc)
+        timestamp=now_eastern()
     )
 
     total_payout = 0.0
@@ -1300,7 +1307,7 @@ async def performance(ctx):
         return
 
     embed = discord.Embed(title="📊 Weekly Performance Ratings", color=0x5865F2,
-                          timestamp=datetime.now(timezone.utc))
+                          timestamp=now_eastern())
 
     for uid, stats in weekly_stats[ctx.guild.id].items():
         member = ctx.guild.get_member(uid)
@@ -1346,7 +1353,7 @@ async def show_milestones(ctx):
         return
 
     embed = discord.Embed(title="🏆 Revenue Milestones", color=0xFFD700,
-                          timestamp=datetime.now(timezone.utc))
+                          timestamp=now_eastern())
 
     for model_name, data in models[ctx.guild.id].items():
         total = data.get("revenue", 0)
@@ -1650,7 +1657,7 @@ async def leaderboard(ctx):
     )
 
     embed = discord.Embed(title="🏆 Weekly Leaderboard", color=0xFFD700,
-                          timestamp=datetime.now(timezone.utc))
+                          timestamp=now_eastern())
 
     medals = ["🥇", "🥈", "🥉"]
     for i, (user_id, stats) in enumerate(sorted_chatters[:10]):
