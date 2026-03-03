@@ -1,9 +1,10 @@
- import discord
+import discord
 from discord.ext import commands, tasks
 import asyncio
 import random
 import os
 import json
+import aiohttp
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import pytz
@@ -2023,6 +2024,177 @@ async def on_command_error(ctx, error):
             pass
     elif isinstance(error, commands.CommandNotFound):
         pass  # Ignore unknown commands silently
+
+@bot.command(name="diagnose")
+@commands.has_permissions(administrator=True)
+async def diagnose(ctx):
+    """AI scans the bot state and auto-fixes any problems it finds."""
+    await ctx.send("🔍 Running AI diagnosis... give me a moment.")
+
+    now = now_eastern()
+    guild = ctx.guild
+
+    # ── Build a full snapshot of current bot state ──────────────────
+    state_snapshot = []
+
+    # Active chatters
+    for uid, s in chatter_state.get(guild.id, {}).items():
+        if not s.get("active"):
+            continue
+        member = guild.get_member(uid)
+        name = member.display_name if member else f"Unknown({uid})"
+        shift = s.get("shift", "?")
+        shift_info = SHIFTS.get(shift, {})
+        start_ts = s.get("shift_start_ts", 0)
+        hours_active = (now_ts() - start_ts) / 3600 if start_ts else 0
+        pending_since = (now_ts() - s.get("ping_sent_at", now_ts())) / 60 if s.get("pending") else 0
+        last_checkin_mins = (now_ts() - s.get("last_checkin", now_ts())) / 60 if s.get("last_checkin") else None
+
+        state_snapshot.append({
+            "user_id": uid,
+            "name": name,
+            "shift": shift,
+            "shift_hours": shift_info.get("hours", "?"),
+            "shift_end_hour": shift_info.get("end"),
+            "hours_active": round(hours_active, 2),
+            "pending_ping": s.get("pending", False),
+            "pending_since_mins": round(pending_since, 1) if s.get("pending") else 0,
+            "last_checkin_mins_ago": round(last_checkin_mins, 1) if last_checkin_mins is not None else None,
+            "active_sale": s.get("active_sale", False),
+            "shift_revenue": s.get("shift_revenue", 0),
+            "shift_checkins": s.get("shift_checkins", 0),
+            "missed_checkins": s.get("missed_checkins", 0),
+        })
+
+    # Current time context
+    context = {
+        "current_time_eastern": now.strftime("%A %I:%M %p ET"),
+        "current_hour": now.hour,
+        "active_chatters": state_snapshot,
+        "total_active": len(state_snapshot),
+    }
+
+    prompt = f"""You are a bot diagnostic AI for an OnlyFans chatting agency management Discord bot.
+
+Current bot state:
+{json.dumps(context, indent=2)}
+
+Shift schedule:
+- Night shift: 7PM - 3AM
+- Morning shift: 3AM - 11AM  
+- Day shift: 11AM - 7PM
+
+Analyze the current state and identify ANY of these problems:
+1. Chatter has been active for longer than 8 hours (their shift should have ended)
+2. Chatter has a ping pending for more than 10 minutes (stuck pending state)
+3. Chatter is active on the wrong shift for the current time (e.g. night shift chatter active at 2PM)
+4. Any other anomalies you detect
+
+For EACH problem found, specify:
+- The user_id of the affected chatter
+- What the problem is
+- What fix to apply (one of: "force_end_shift", "clear_pending", or "no_fix_needed")
+
+Respond ONLY in this exact JSON format with no other text:
+{{
+  "problems_found": [
+    {{
+      "user_id": 123456789,
+      "name": "ChatterName",
+      "problem": "description of problem",
+      "fix": "force_end_shift"
+    }}
+  ],
+  "summary": "one sentence summary"
+}}
+
+If no problems found, return problems_found as an empty array."""
+
+    # ── Call Anthropic API ───────────────────────────────────────────
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+            ) as resp:
+                data = await resp.json()
+                raw = data["content"][0]["text"].strip()
+    except Exception as e:
+        await ctx.send(f"❌ AI call failed: {e}")
+        return
+
+    # ── Parse AI response ────────────────────────────────────────────
+    try:
+        result = json.loads(raw)
+    except:
+        await ctx.send(f"❌ AI returned unreadable response:\n```{raw[:500]}```")
+        return
+
+    problems = result.get("problems_found", [])
+    summary = result.get("summary", "Diagnosis complete.")
+
+    if not problems:
+        await ctx.send(f"✅ **AI Diagnosis: No problems found.**\n{summary}")
+        return
+
+    # ── Apply fixes ──────────────────────────────────────────────────
+    fix_log = [f"🔧 **AI Diagnosis — {len(problems)} problem(s) found**\n_{summary}_\n"]
+
+    for p in problems:
+        uid = p.get("user_id")
+        name = p.get("name", str(uid))
+        problem = p.get("problem", "Unknown issue")
+        fix = p.get("fix", "no_fix_needed")
+
+        fix_log.append(f"\n**{name}** — {problem}")
+
+        if fix == "force_end_shift" and uid in chatter_state.get(guild.id, {}):
+            s = chatter_state[guild.id][uid]
+            shift_key = s.get("shift", "")
+
+            # Calculate hours and log them
+            start_ts = s.get("shift_start_ts", now_ts())
+            hours = (now_ts() - start_ts) / 3600
+            w = get_weekly_stats(guild.id, uid, name)
+            w["hours_worked"] = w.get("hours_worked", 0) + hours
+
+            # End the shift
+            s["active"] = False
+            s["pending"] = False
+            warn_key = f"{guild.id}_{uid}"
+            end_shift_warned.pop(warn_key, None)
+
+            # Free model slot
+            assigned_model = get_chatter_model(guild.id, uid)
+            if assigned_model and guild.id in models and assigned_model in models[guild.id]:
+                slot_key = f"{assigned_model}_{shift_key}"
+                if models[guild.id][assigned_model].get("active_slot") == slot_key:
+                    models[guild.id][assigned_model].pop("active_slot", None)
+
+            save_data()
+            fix_log.append(f"  → ✅ Force-ended their shift ({hours:.1f}hrs logged)")
+
+        elif fix == "clear_pending" and uid in chatter_state.get(guild.id, {}):
+            s = chatter_state[guild.id][uid]
+            s["pending"] = False
+            s["alert_sent"] = False
+            s["warning_sent"] = False
+            s["next_ping"] = now_ts() + random_interval()
+            fix_log.append(f"  → ✅ Cleared stuck pending state, rescheduled ping")
+
+        else:
+            fix_log.append(f"  → ℹ️ No automatic fix applied")
+
+    await ctx.send("\n".join(fix_log))
 
 # ─── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
