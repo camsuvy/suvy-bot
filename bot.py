@@ -1,4 +1,4 @@
-import discord
+ import discord
 from discord.ext import commands, tasks
 import asyncio
 import random
@@ -20,8 +20,6 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))          # YOUR Discord user ID
 RESPONSE_TIMEOUT = 5 * 60                            # 5 min to respond before alert
-MIN_INTERVAL = 10 * 60                               # 10 min minimum between pings
-MAX_INTERVAL = 40 * 60                               # 40 min maximum between pings
 
 SHIFTS = {
     "night":   {"name": "🌙 Night Shift",   "hours": "7 PM – 3 AM",  "start": 19, "end": 3},
@@ -54,6 +52,9 @@ weekly_stats = {}  # { guild_id: { user_id: { name, ppv, revenue, checkins } } }
 chatter_daily = {}  # { guild_id: { user_id: { revenue, date } } }
 last_stats = {}  # { guild_id: { user_id: { ppv, fans, revenue, count } } } — for anti-cheat
 roster = {}  # { guild_id: { shift_key: [ user_id, ... ] } }  — expected chatters per shift
+end_shift_warned = {}  # { "guild_id_user_id": True } — prevents end shift warning spam
+recap_sent_date = {}   # { guild_id: "YYYY-MM-DD" } — prevents double daily recap
+weekly_sent_date = {}  # { guild_id: "YYYY-WW" } — prevents double weekly review
 strikes = {}  # { guild_id: { user_id: { count, reasons: [] } } }
 daily_goal = {}  # { guild_id: { goal: float, current: float, date: str } }
 model_weekly_goal = 5000.0  # Default $5k per model per week (Mon-Sat)
@@ -61,6 +62,57 @@ milestones_hit = {}  # { guild_id: { model_name: [milestones already celebrated]
 REVENUE_MILESTONES = [500, 1000, 2500, 5000, 7500, 10000, 15000, 20000]
 models = {}  # { guild_id: { model_name: { chatters: [user_id], revenue: float, ppv: int } } }
 chatter_model = {}  # { guild_id: { user_id: model_name } }
+
+DATA_FILE = "agency_data.json"
+
+def save_data():
+    """Save all persistent data to disk."""
+    def int_keys(d):
+        """Convert string keys back to ints for guild/user IDs."""
+        return d
+
+    data = {
+        "weekly_stats":   {str(g): {str(u): v for u, v in ud.items()} for g, ud in weekly_stats.items()},
+        "strikes":        {str(g): {str(u): v for u, v in ud.items()} for g, ud in strikes.items()},
+        "roster":         {str(g): {sk: [str(u) for u in ul] for sk, ul in sd.items()} for g, sd in roster.items()},
+        "models":         {str(g): md for g, md in models.items()},
+        "chatter_model":  {str(g): {str(u): m for u, m in ud.items()} for g, ud in chatter_model.items()},
+        "milestones_hit": {str(g): mh for g, mh in milestones_hit.items()},
+        "daily_goal":     {str(g): dg for g, dg in daily_goal.items()},
+    }
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"⚠️ Failed to save data: {e}")
+
+def load_data():
+    """Load persistent data from disk on startup."""
+    global weekly_stats, strikes, roster, models, chatter_model, milestones_hit, daily_goal
+    try:
+        with open(DATA_FILE, "r") as f:
+            data = json.load(f)
+
+        weekly_stats  = {int(g): {int(u): v for u, v in ud.items()} for g, ud in data.get("weekly_stats", {}).items()}
+        strikes       = {int(g): {int(u): v for u, v in ud.items()} for g, ud in data.get("strikes", {}).items()}
+        roster        = {int(g): {sk: [int(u) for u in ul] for sk, ul in sd.items()} for g, sd in data.get("roster", {}).items()}
+        raw_models = data.get("models", {})
+        models = {}
+        for g, model_dict in raw_models.items():
+            models[int(g)] = {}
+            for model_name, model_data in model_dict.items():
+                models[int(g)][model_name] = model_data
+                # Convert chatter IDs from strings back to ints
+                if "chatters" in model_data:
+                    models[int(g)][model_name]["chatters"] = [int(u) for u in model_data["chatters"]]
+        chatter_model = {int(g): {int(u): m for u, m in ud.items()} for g, ud in data.get("chatter_model", {}).items()}
+        milestones_hit = {int(g): mh for g, mh in data.get("milestones_hit", {}).items()}
+        daily_goal    = {int(g): dg for g, dg in data.get("daily_goal", {}).items()}
+        print("✅ Data loaded from disk.")
+    except FileNotFoundError:
+        print("ℹ️ No save file found — starting fresh.")
+    except Exception as e:
+        print(f"⚠️ Failed to load data: {e}")
 
 def get_state(guild_id, user_id):
     if guild_id not in chatter_state:
@@ -151,13 +203,23 @@ def get_overall_daily_goal(guild_id):
     return sum(get_model_daily_goal(guild_id, m) for m in models[guild_id])
 
 def random_interval():
-    return random.randint(MIN_INTERVAL, MAX_INTERVAL)
+    """Truly unpredictable ping interval — no detectable pattern."""
+    # Pick a random strategy each time so there's zero pattern
+    roll = random.random()
+    if roll < 0.2:
+        return random.randint(5 * 60, 15 * 60)    # 20% chance: very soon (5-15 min)
+    elif roll < 0.5:
+        return random.randint(15 * 60, 30 * 60)   # 30% chance: normal (15-30 min)
+    elif roll < 0.8:
+        return random.randint(30 * 60, 50 * 60)   # 30% chance: longer wait (30-50 min)
+    else:
+        return random.randint(50 * 60, 70 * 60)   # 20% chance: long wait (50-70 min)
 
 def now_ts():
     return now_eastern().timestamp()
 
 def fmt_time(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%I:%M %p UTC")
+    return datetime.fromtimestamp(ts, tz=AGENCY_TZ).strftime("%I:%M %p ET")
 
 async def get_channel(guild, name):
     return discord.utils.get(guild.text_channels, name=name)
@@ -172,6 +234,7 @@ async def get_alerts_channel(guild):
 @bot.event
 async def on_ready():
     print(f"✅ Suvy Agency Bot is online as {bot.user}")
+    load_data()
     monitor_loop.start()
 
 @bot.event
@@ -205,12 +268,17 @@ async def on_message(message):
         state["next_ping"] = now_ts() + next_in
         next_min = next_in // 60
 
-        # Update shift totals
+        # Update shift totals (shared)
         shift_key = SHIFT_CHANNELS[channel_name]
         totals = get_shift_totals(guild.id, shift_key)
         totals["ppv"] += ppv
         totals["revenue"] += rev
         totals["checkins"] += 1
+
+        # Update per-chatter shift totals
+        state["shift_ppv"] = state.get("shift_ppv", 0) + ppv
+        state["shift_revenue"] = state.get("shift_revenue", 0.0) + rev
+        state["shift_checkins"] = state.get("shift_checkins", 0) + 1
 
         # Update weekly leaderboard
         w = get_weekly_stats(guild.id, user_id, message.author.display_name)
@@ -384,8 +452,11 @@ async def on_message(message):
             if state.get("ping_sent_at"):
                 resp_secs = now_ts() - state["ping_sent_at"]
                 embed.add_field(name="Response Time", value=f"{resp_secs//60}m {resp_secs%60}s", inline=True)
-            embed.set_footer(text=f"Next ping in ~{next_min} min (random) • {fmt_time(now_ts())}")
+            embed.set_footer(text=f"Logged • {fmt_time(now_ts())}")
             await log_ch.send(embed=embed)
+
+        # Simple confirmation in shift channel — no timing info
+        await message.reply("✅ Stats logged. Stay active.", mention_author=False)
 
     await bot.process_commands(message)
 
@@ -422,17 +493,28 @@ def parse_stats(text):
 # ─── BACKGROUND MONITOR LOOP ───────────────────────────────────────────────────
 @tasks.loop(seconds=30)
 async def monitor_loop():
+    # Auto-save data every 2 loop cycles (~60 seconds)
+    if not hasattr(monitor_loop, "_save_counter"):
+        monitor_loop._save_counter = 0
+    monitor_loop._save_counter += 1
+    if monitor_loop._save_counter >= 2:
+        monitor_loop._save_counter = 0
+        save_data()
+
     for guild in bot.guilds:
         # Check roster for no-shows (15 min after shift start) — Monday to Saturday only
         now = now_eastern()
-        if now.weekday() < 6:  # 0=Monday, 5=Saturday, 6=Sunday (skip Sunday)
+        if now.weekday() < 6:
             for shift_key, shift_info in SHIFTS.items():
                 start_hour = shift_info["start"]
                 if now.hour == start_hour and now.minute == 15:
                     expected = roster.get(guild.id, {}).get(shift_key, [])
                     for user_id in expected:
-                        active = chatter_state.get(guild.id, {}).get(user_id, {}).get("active", False)
-                        if not active:
+                        state = chatter_state.get(guild.id, {}).get(user_id, {})
+                        active = state.get("active", False)
+                        noshow_key = f"noshow_{guild.id}_{user_id}_{shift_key}_{now.strftime('%Y-%m-%d')}"
+                        if not active and not end_shift_warned.get(noshow_key):
+                            end_shift_warned[noshow_key] = True
                             member = guild.get_member(user_id)
                             owner = guild.get_member(OWNER_ID)
                             if owner and member:
@@ -440,7 +522,7 @@ async def monitor_loop():
                                     await owner.send(
                                         f"🚨 **No-show alert!**\n"
                                         f"**{member.display_name}** was expected for {shift_info['name']} "
-                                        f"and hasn't been started yet (15 min past shift start)."
+                                        f"and hasn't started yet (15 min past shift start)."
                                     )
                                 except:
                                     pass
@@ -456,41 +538,46 @@ async def monitor_loop():
 
         # ── DAILY RECAP DM at 3AM every day ─────────────────────────
         if now.hour == 3 and now.minute == 0 and now.weekday() < 6:
-            owner = guild.get_member(OWNER_ID)
-            if owner:
-                overall_goal = get_overall_daily_goal(guild.id)
-                goal_data = get_daily_goal(guild.id)
-                current_rev = goal_data.get("current", 0)
-                pct = min(100, (current_rev / overall_goal * 100)) if overall_goal > 0 else 0
+            today_str = now.strftime("%Y-%m-%d")
+            if recap_sent_date.get(guild.id) != today_str:
+                recap_sent_date[guild.id] = today_str
+                owner = guild.get_member(OWNER_ID)
+                if owner:
+                    overall_goal = get_overall_daily_goal(guild.id)
+                    goal_data = get_daily_goal(guild.id)
+                    current_rev = goal_data.get("current", 0)
+                    pct = min(100, (current_rev / overall_goal * 100)) if overall_goal > 0 else 0
 
-                recap_lines = [f"📊 **Daily Recap — {now.strftime('%A %b %d')}**\n"]
-                recap_lines.append(f"💰 Total Revenue: ${current_rev:.2f} / ${overall_goal:.2f} ({pct:.0f}%)\n")
+                    recap_lines = [f"📊 **Daily Recap — {now.strftime('%A %b %d')}**\n"]
+                    recap_lines.append(f"💰 Total Revenue: ${current_rev:.2f} / ${overall_goal:.2f} ({pct:.0f}%)\n")
 
-                # Per model breakdown
-                if guild.id in models and models[guild.id]:
-                    for model_name, data in models[guild.id].items():
-                        model_rev = sum(get_chatter_daily(guild.id, uid)["revenue"] for uid in data["chatters"])
-                        model_goal = get_model_daily_goal(guild.id, model_name)
-                        recap_lines.append(f"\n📌 **{model_name}** — ${model_rev:.2f} / ${model_goal:.2f}")
-                        for uid in data["chatters"]:
-                            m = guild.get_member(uid)
-                            if m:
-                                cd = get_chatter_daily(guild.id, uid)
-                                cg = get_chatter_daily_goal(guild.id, uid)
-                                missed = chatter_state.get(guild.id, {}).get(uid, {}).get("missed_checkins", 0)
-                                recap_lines.append(f"  • {m.display_name}: ${cd['revenue']:.2f} / ${cg:.2f} | Missed: {missed}")
+                    if guild.id in models and models[guild.id]:
+                        for model_name, data in models[guild.id].items():
+                            model_rev = sum(get_chatter_daily(guild.id, uid)["revenue"] for uid in data["chatters"])
+                            model_goal = get_model_daily_goal(guild.id, model_name)
+                            recap_lines.append(f"\n📌 **{model_name}** — ${model_rev:.2f} / ${model_goal:.2f}")
+                            for uid in data["chatters"]:
+                                m = guild.get_member(uid)
+                                if m:
+                                    cd = get_chatter_daily(guild.id, uid)
+                                    cg = get_chatter_daily_goal(guild.id, uid)
+                                    missed = chatter_state.get(guild.id, {}).get(uid, {}).get("missed_checkins", 0)
+                                    recap_lines.append(f"  • {m.display_name}: ${cd['revenue']:.2f} / ${cg:.2f} | Missed: {missed}")
 
-                try:
-                    await owner.send("\n".join(recap_lines))
-                except:
-                    pass
+                    try:
+                        await owner.send("\n".join(recap_lines))
+                    except:
+                        pass
 
         # ── WEEKLY PERFORMANCE RATING every Sunday at 3AM ────────────
         if now.weekday() == 6 and now.hour == 3 and now.minute == 0:
-            owner = guild.get_member(OWNER_ID)
-            if guild.id in weekly_stats and weekly_stats[guild.id]:
-                rating_lines = ["🏆 **Weekly Performance Report**\n"]
-                low_performers = []
+            week_str = now.strftime("%Y-%W")
+            if weekly_sent_date.get(guild.id) != week_str:
+                weekly_sent_date[guild.id] = week_str
+                owner = guild.get_member(OWNER_ID)
+                if guild.id in weekly_stats and weekly_stats[guild.id]:
+                    rating_lines = ["🏆 **Weekly Performance Report**\n"]
+                    low_performers = []
 
                 for uid, stats in weekly_stats[guild.id].items():
                     member = guild.get_member(uid)
@@ -576,6 +663,101 @@ async def monitor_loop():
                 if log_ch:
                     await log_ch.send("\n".join(rating_lines))
 
+        # ── AUTO RESET WEEKLY STATS every Monday at midnight ─────────
+        if now.weekday() == 0 and now.hour == 0 and now.minute == 0:
+            reset_key = f"reset_{guild.id}_{now.strftime('%Y-%W')}"
+            if not end_shift_warned.get(reset_key):
+                end_shift_warned[reset_key] = True
+                if guild.id in weekly_stats:
+                    weekly_stats[guild.id] = {}
+                save_data()
+                print(f"✅ Weekly stats auto-reset for guild {guild.id}")
+
+        # ── PAY REMINDER every Monday at 9AM ────────────────────────
+        if now.weekday() == 0 and now.hour == 9 and now.minute == 0:
+            pay_key = f"payreminder_{guild.id}_{now.strftime('%Y-%W')}"
+            if not end_shift_warned.get(pay_key):
+                end_shift_warned[pay_key] = True
+                owner = guild.get_member(OWNER_ID)
+                if owner and guild.id in weekly_stats and weekly_stats[guild.id]:
+                    pay_lines = ["💸 **Monday Pay Reminder — Suvy Agency**\n"]
+                    total_payout = 0.0
+                    for uid, stats in weekly_stats[guild.id].items():
+                        m = guild.get_member(uid)
+                        name = stats.get("name", m.display_name if m else str(uid))
+                        hours = stats.get("hours_worked", 0)
+                        rev   = stats.get("revenue", 0.0)
+                        hourly = hours * 3.0
+                        comm   = rev * 0.025
+                        total  = hourly + comm
+                        total_payout += total
+                        pay_lines.append(f"  • {name}: ${hourly:.2f} (hrs) + ${comm:.2f} (comm) = **${total:.2f}**")
+                    pay_lines.append(f"\n💵 **Total to pay out: ${total_payout:.2f}**")
+                    try:
+                        await owner.send("\n".join(pay_lines))
+                    except:
+                        pass
+
+        # ── MORNING BRIEFING every day at 11AM ──────────────────────
+        if now.hour == 11 and now.minute == 0:
+            briefing_key = f"briefing_{guild.id}_{now.strftime('%Y-%m-%d')}"
+            if not end_shift_warned.get(briefing_key):
+                end_shift_warned[briefing_key] = True
+                owner = guild.get_member(OWNER_ID)
+                if owner:
+                    lines = [f"☀️ **Morning Briefing — {now.strftime('%A %b %d')}**\n"]
+                    # Overnight shift summary
+                    night_total = 0.0
+                    night_checkins = 0
+                    night_missed = 0
+                    if guild.id in chatter_state:
+                        for uid, s in chatter_state[guild.id].items():
+                            if s.get("shift") == "night":
+                                night_total += s.get("shift_revenue", 0)
+                                night_checkins += s.get("shift_checkins", 0)
+                                night_missed += s.get("missed_checkins", 0)
+                    lines.append(f"🌙 Night Shift: ${night_total:.2f} revenue | {night_checkins} check-ins | {night_missed} missed")
+                    # Current active chatters
+                    active = [s.get("name") for s in chatter_state.get(guild.id, {}).values() if s.get("active")]
+                    lines.append(f"🟢 Currently active: {', '.join(active) if active else 'Nobody'}")
+                    # Daily goal progress
+                    goal_data = get_daily_goal(guild.id)
+                    overall_goal = get_overall_daily_goal(guild.id)
+                    pct = (goal_data["current"] / overall_goal * 100) if overall_goal > 0 else 0
+                    lines.append(f"🎯 Daily goal: ${goal_data['current']:.2f} / ${overall_goal:.2f} ({pct:.0f}%)")
+                    try:
+                        await owner.send("\n".join(lines))
+                    except:
+                        pass
+
+        # ── COVERAGE ALERT — no chatter on shift at start time ───────
+        if now.weekday() < 6:
+            for shift_key, shift_info in SHIFTS.items():
+                if now.hour == shift_info["start"] and now.minute == 0:
+                    coverage_key = f"coverage_{guild.id}_{shift_key}_{now.strftime('%Y-%m-%d')}"
+                    if not end_shift_warned.get(coverage_key):
+                        active_on_shift = any(
+                            s.get("active") and s.get("shift") == shift_key
+                            for s in chatter_state.get(guild.id, {}).values()
+                        )
+                        if not active_on_shift:
+                            end_shift_warned[coverage_key] = True
+                            owner = guild.get_member(OWNER_ID)
+                            if owner:
+                                try:
+                                    await owner.send(
+                                        f"🚨 **Coverage Alert — Suvy Agency**\n"
+                                        f"**{shift_info['name']}** just started and nobody is online.\n"
+                                        f"The account is unattended right now."
+                                    )
+                                except:
+                                    pass
+                            alerts_ch = await get_alerts_channel(guild)
+                            if alerts_ch:
+                                await alerts_ch.send(
+                                    f"🚨 **{shift_info['name']} started with no chatter online!**"
+                                )
+
         if guild.id not in chatter_state:
             continue
         for user_id, state in chatter_state[guild.id].items():
@@ -592,17 +774,20 @@ async def monitor_loop():
             shift_key_active = state.get("shift")
             if shift_key_active and shift_key_active in SHIFTS:
                 end_hour = SHIFTS[shift_key_active]["end"]
-                # Calculate minutes past shift end
+                # Calculate minutes past shift end (handle overnight shifts)
                 mins_past_end = 0
-                if now.hour == end_hour and now.minute >= 5:
-                    mins_past_end = now.minute
-                elif now.hour > end_hour:
+                if shift_key_active == "night":
+                    # Night shift ends at 3AM next day
+                    if now.hour >= 3 and now.hour < 19:
+                        mins_past_end = (now.hour - 3) * 60 + now.minute
+                elif now.hour > end_hour or (now.hour == end_hour and now.minute > 0):
                     mins_past_end = (now.hour - end_hour) * 60 + now.minute
 
-                if mins_past_end >= 15 and not state.get("end_strike_sent") and not state.get("active_sale"):
+                warn_key = f"{guild.id}_{user_id}"
+                if mins_past_end >= 15 and not end_shift_warned.get(warn_key) and not state.get("active_sale"):
+                    end_shift_warned[warn_key] = True  # Set FIRST to prevent spam
                     member = guild.get_member(user_id)
                     if member:
-                        # Find next shift
                         next_shift_map = {"night": "morning", "morning": "day", "day": "night"}
                         next_shift = SHIFTS[next_shift_map[shift_key_active]]["name"]
                         try:
@@ -614,7 +799,6 @@ async def monitor_loop():
                             )
                         except:
                             pass
-                        # Also ping them in shift channel
                         ch_name = next((k for k, v in SHIFT_CHANNELS.items() if v == shift_key_active), None)
                         shift_ch = await get_channel(guild, ch_name) if ch_name else None
                         if shift_ch:
@@ -639,8 +823,7 @@ async def monitor_loop():
 
                 msg = await channel.send(
                     f"📋 {member.mention} **Check-in time!**\n"
-                    f"Reply with your stats: `PPV: X | Fans: X | Rev: $X`\n"
-                    f"*(You have 5 minutes to respond)*"
+                    f"Reply with your stats: `PPV: X | Fans: X | Rev: $X | Msgs: X | Convos: X`"
                 )
                 state["pending"] = True
                 state["ping_msg_id"] = msg.id
@@ -668,6 +851,7 @@ async def monitor_loop():
                 # 5 min — alert owner
                 if elapsed >= RESPONSE_TIMEOUT and not state.get("alert_sent"):
                     state["alert_sent"] = True
+                    state["missed_checkins"] = state.get("missed_checkins", 0) + 1
 
                     # DM the owner
                     owner = guild.get_member(OWNER_ID)
@@ -697,10 +881,8 @@ async def monitor_loop():
 @bot.command(name="startshift")
 async def start_shift(ctx, member: discord.Member = None, shift_key: str = None):
     """Start your shift. Usage: !startshift @yourname night"""
-    # If no member specified, assume themselves
-    if member is None:
-        member = ctx.author
-        await ctx.send("❌ Usage: `!startshift @yourname night` (options: night, morning, day)")
+    if member is None or shift_key is None:
+        await ctx.send("❌ Usage: `!startshift @YourName night` (options: night, morning, day)")
         return
 
     # Chatters can only start their OWN shift
@@ -748,6 +930,11 @@ async def start_shift(ctx, member: discord.Member = None, shift_key: str = None)
     state["end_strike_sent"] = False
     state["active_sale"] = False
     state["shift_start_ts"] = now_ts()
+    state["shift_ppv"] = 0
+    state["shift_revenue"] = 0.0
+    state["shift_checkins"] = 0
+    state["missed_checkins"] = 0
+    end_shift_warned[f"{ctx.guild.id}_{member.id}"] = False
     next_in = random_interval()
     state["next_ping"] = now_ts() + next_in
 
@@ -757,17 +944,26 @@ async def start_shift(ctx, member: discord.Member = None, shift_key: str = None)
     )
     embed.add_field(name="Shift", value=SHIFTS[shift_key]["name"], inline=True)
     embed.add_field(name="Hours", value=SHIFTS[shift_key]["hours"], inline=True)
-    embed.add_field(name="First ping in", value=f"~{next_in // 60} min (random)", inline=True)
 
-    # Auto-detect if they're late (3 min grace period)
+    # Auto-detect if they're late (3 min grace period from shift start)
     now = now_eastern()
     shift_start_hour = SHIFTS[shift_key]["start"]
     current_hour = now.hour
+    current_minute = now.minute
     minutes_late = 0
-    if current_hour >= shift_start_hour:
-        minutes_late = (current_hour - shift_start_hour) * 60 + now.minute
-    elif shift_key == "night" and current_hour < 3:
-        minutes_late = (current_hour + 24 - shift_start_hour) * 60 + now.minute
+
+    if shift_key == "night":
+        if current_hour == shift_start_hour:
+            minutes_late = current_minute  # minutes past 7PM
+        elif current_hour > shift_start_hour or current_hour < 3:
+            if current_hour < 3:
+                minutes_late = (current_hour + 24 - shift_start_hour) * 60 + current_minute
+            else:
+                minutes_late = (current_hour - shift_start_hour) * 60 + current_minute
+    elif current_hour == shift_start_hour:
+        minutes_late = current_minute
+    elif current_hour > shift_start_hour:
+        minutes_late = (current_hour - shift_start_hour) * 60 + current_minute
 
     if minutes_late > 3:
         embed.add_field(name="⚠️ Late", value=f"{minutes_late} minutes past shift start", inline=False)
@@ -813,7 +1009,7 @@ async def start_shift(ctx, member: discord.Member = None, shift_key: str = None)
     if shift_ch:
         await shift_ch.send(
             f"👋 {member.mention} Your shift has started! Stay active — you'll receive random check-in pings.\n"
-            f"When pinged, reply with: `PPV: X | Fans: X | Rev: $X`\n"
+            f"When pinged, reply with: `PPV: X | Fans: X | Rev: $X | Msgs: X | Convos: X`\n"
             f"📺 **Join the {SHIFTS[shift_key]['name']} voice channel and share your screen now.**"
         )
 
@@ -835,7 +1031,13 @@ async def end_shift(ctx, member: discord.Member = None):
         return
 
     shift_key = state.get("shift", "")
-    totals = get_shift_totals(ctx.guild.id, shift_key)
+
+    # Use per-chatter totals for accurate summary
+    chatter_ppv = state.get("shift_ppv", 0)
+    chatter_rev = state.get("shift_revenue", 0.0)
+    chatter_checkins = state.get("shift_checkins", 0)
+    chatter_missed = state.get("missed_checkins", 0)
+    hours_worked = (now_ts() - state.get("shift_start_ts", now_ts())) / 3600
 
     # Free up the shift slot for this model
     assigned_model = get_chatter_model(ctx.guild.id, member.id)
@@ -843,6 +1045,10 @@ async def end_shift(ctx, member: discord.Member = None):
         slot_key = f"{assigned_model}_{shift_key}"
         if models[ctx.guild.id][assigned_model].get("active_slot") == slot_key:
             models[ctx.guild.id][assigned_model].pop("active_slot", None)
+
+    # Clear end shift warning flag
+    warn_key = f"{ctx.guild.id}_{member.id}"
+    end_shift_warned.pop(warn_key, None)
 
     # Track hours worked this week
     shift_start_ts = state.get("shift_start_ts", now_ts())
@@ -852,27 +1058,32 @@ async def end_shift(ctx, member: discord.Member = None):
 
     state["active"] = False
     state["pending"] = False
+    end_shift_warned[f"{ctx.guild.id}_{member.id}"] = False  # Reset warn flag on endshift
 
     embed = discord.Embed(title=f"⏹ Shift Ended — {member.display_name}", color=0xff6600)
     embed.add_field(name="Shift", value=SHIFTS.get(shift_key, {}).get("name", "—"), inline=True)
-    embed.add_field(name="Total Check-ins", value=str(totals["checkins"]), inline=True)
-    embed.add_field(name="Total PPVs", value=str(totals["ppv"]), inline=True)
-    embed.add_field(name="Total Revenue", value=f"${totals['revenue']:.2f}", inline=True)
+    embed.add_field(name="Check-ins", value=str(chatter_checkins), inline=True)
+    embed.add_field(name="Missed", value=str(chatter_missed), inline=True)
+    embed.add_field(name="PPVs Sent", value=str(chatter_ppv), inline=True)
+    embed.add_field(name="Revenue", value=f"${chatter_rev:.2f}", inline=True)
+    embed.add_field(name="Hours Worked", value=f"{hours_worked:.1f}hr", inline=True)
     await ctx.send(embed=embed)
 
-    # Post daily summary to stats-log
+    # Post summary to stats-log
     log_ch = await get_log_channel(ctx.guild)
     if log_ch:
         summary = discord.Embed(
-            title=f"📋 Daily Shift Summary — {member.display_name}",
+            title=f"📋 Shift Summary — {member.display_name}",
             color=0x5865F2,
-            timestamp=now_eastern()
+            timestamp=datetime.now(timezone.utc)
         )
         summary.add_field(name="Shift", value=SHIFTS.get(shift_key, {}).get("name", "—"), inline=True)
-        summary.add_field(name="Check-ins", value=str(totals["checkins"]), inline=True)
-        summary.add_field(name="PPVs Sent", value=str(totals["ppv"]), inline=True)
-        summary.add_field(name="Revenue", value=f"${totals['revenue']:.2f}", inline=True)
-        avg_rev = totals["revenue"] / totals["checkins"] if totals["checkins"] > 0 else 0
+        summary.add_field(name="Check-ins", value=str(chatter_checkins), inline=True)
+        summary.add_field(name="Missed", value=str(chatter_missed), inline=True)
+        summary.add_field(name="PPVs Sent", value=str(chatter_ppv), inline=True)
+        summary.add_field(name="Revenue", value=f"${chatter_rev:.2f}", inline=True)
+        summary.add_field(name="Hours Worked", value=f"{hours_worked:.1f}hr", inline=True)
+        avg_rev = chatter_rev / chatter_checkins if chatter_checkins > 0 else 0
         summary.add_field(name="Avg Rev/Check-in", value=f"${avg_rev:.2f}", inline=True)
         if assigned_model:
             summary.add_field(name="Model", value=assigned_model, inline=True)
@@ -1066,6 +1277,7 @@ async def add_chatter(ctx, member: discord.Member, shift_key: str, *, model_name
     embed.add_field(name="Model", value=model_text, inline=True)
     embed.add_field(name="Next Step", value=f"Use `!onboard @{member.display_name} {shift_key}` to send them the welcome message", inline=False)
     await ctx.send(embed=embed)
+    save_data()
 
 @bot.command(name="strike")
 @commands.has_permissions(manage_messages=True)
@@ -1099,6 +1311,7 @@ async def give_strike(ctx, member: discord.Member, *, reason: str = "No reason p
     log_ch = await get_log_channel(ctx.guild)
     if log_ch:
         await log_ch.send(embed=embed)
+    save_data()
 
 @bot.command(name="strikes")
 @commands.has_permissions(manage_messages=True)
@@ -1134,6 +1347,7 @@ async def clear_strikes(ctx, member: discord.Member):
     if ctx.guild.id in strikes and member.id in strikes[ctx.guild.id]:
         strikes[ctx.guild.id][member.id] = {"count": 0, "reasons": []}
     await ctx.send(f"✅ Strikes cleared for {member.display_name}.")
+    save_data()
 
 @bot.command(name="setgoal")
 @commands.has_permissions(manage_messages=True)
@@ -1164,7 +1378,7 @@ async def check_goal(ctx):
     bar = "🟩" * filled + "⬛" * (10 - filled)
 
     embed = discord.Embed(title="🎯 Daily Revenue Goals", color=0x00ff88,
-                          timestamp=now_eastern())
+                          timestamp=datetime.now(timezone.utc))
 
     # Overall
     embed.add_field(
@@ -1257,7 +1471,7 @@ async def pay(ctx):
     embed = discord.Embed(
         title="💸 Weekly Payout Sheet",
         color=0xFFD700,
-        timestamp=now_eastern()
+        timestamp=datetime.now(timezone.utc)
     )
 
     total_payout = 0.0
@@ -1314,7 +1528,7 @@ async def performance(ctx):
         return
 
     embed = discord.Embed(title="📊 Weekly Performance Ratings", color=0x5865F2,
-                          timestamp=now_eastern())
+                          timestamp=datetime.now(timezone.utc))
 
     for uid, stats in weekly_stats[ctx.guild.id].items():
         member = ctx.guild.get_member(uid)
@@ -1361,7 +1575,7 @@ async def show_milestones(ctx):
         return
 
     embed = discord.Embed(title="🏆 Revenue Milestones", color=0xFFD700,
-                          timestamp=now_eastern())
+                          timestamp=datetime.now(timezone.utc))
 
     for model_name, data in models[ctx.guild.id].items():
         total = data.get("revenue", 0)
@@ -1557,6 +1771,7 @@ async def add_to_roster(ctx, member: discord.Member, shift_key: str):
     if member.id not in roster[ctx.guild.id][shift_key]:
         roster[ctx.guild.id][shift_key].append(member.id)
     await ctx.send(f"✅ {member.display_name} added to {SHIFTS[shift_key]['name']} roster.")
+    save_data()
 
 @bot.command(name="removefromroster")
 @commands.has_permissions(manage_messages=True)
@@ -1570,6 +1785,7 @@ async def remove_from_roster(ctx, member: discord.Member, shift_key: str):
             uid for uid in roster[ctx.guild.id][shift_key] if uid != member.id
         ]
     await ctx.send(f"✅ {member.display_name} removed from {SHIFTS[shift_key]['name']} roster.")
+    save_data()
 
 @bot.command(name="roster")
 @commands.has_permissions(manage_messages=True)
@@ -1665,12 +1881,12 @@ async def onboard(ctx, member: discord.Member, shift_key: str = None):
     embed.add_field(name="Your Shift", value=f"{shift_info['name']} ({shift_info['hours']})", inline=False)
     embed.add_field(
         name="How Check-ins Work",
-        value="The bot will ping you randomly during your shift.\nYou have **5 minutes** to reply with your stats.\nNo response = manager gets alerted immediately.",
+        value="The bot will ping you randomly during your shift.\nReply promptly with your stats.\nNo response = manager gets alerted immediately.",
         inline=False
     )
     embed.add_field(
         name="Check-in Format",
-        value="`PPV: X | Fans: X | Rev: $X`\nExample: `PPV: 8 | Fans: 22 | Rev: $180`",
+        value="`PPV: X | Fans: X | Rev: $X | Msgs: X | Convos: X`\nExample: `PPV: 8 | Fans: 22 | Rev: $180`",
         inline=False
     )
     embed.add_field(
@@ -1680,7 +1896,7 @@ async def onboard(ctx, member: discord.Member, shift_key: str = None):
     )
     embed.add_field(
         name="Rules",
-        value="✅ Always be online during your shift hours\n✅ Respond to pings within 5 minutes\n✅ Keep your stats accurate\n❌ Going AFK without notice = strike",
+        value="✅ Always be online during your shift hours\n✅ Respond to pings immediately\n✅ Keep your stats accurate\n❌ Going AFK without notice = strike",
         inline=False
     )
     embed.set_footer(text="Welcome to the team 🚀")
@@ -1708,7 +1924,7 @@ async def leaderboard(ctx):
     )
 
     embed = discord.Embed(title="🏆 Weekly Leaderboard", color=0xFFD700,
-                          timestamp=now_eastern())
+                          timestamp=datetime.now(timezone.utc))
 
     medals = ["🥇", "🥈", "🥉"]
     for i, (user_id, stats) in enumerate(sorted_chatters[:10]):
@@ -1729,6 +1945,7 @@ async def reset_weekly(ctx):
     if ctx.guild.id in weekly_stats:
         weekly_stats[ctx.guild.id] = {}
     await ctx.send("✅ Weekly leaderboard has been reset.")
+    save_data()
 
 @bot.command(name="shiftreport")
 @commands.has_permissions(manage_messages=True)
