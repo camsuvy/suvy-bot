@@ -880,6 +880,7 @@ async def end_shift(ctx, member: discord.Member = None):
         await log_ch.send(embed=summary)
 
 @bot.command(name="status")
+@commands.has_permissions(manage_messages=True)
 async def status(ctx):
     """Show current status of all active chatters."""
     if ctx.guild.id not in chatter_state:
@@ -938,6 +939,7 @@ async def remove_model(ctx, *, model_name: str):
         await ctx.send(f"❌ Model **{model_name}** not found.")
 
 @bot.command(name="models")
+@commands.has_permissions(manage_messages=True)
 async def list_models(ctx):
     """List all models and their assigned chatters."""
     if ctx.guild.id not in models or not models[ctx.guild.id]:
@@ -1003,6 +1005,7 @@ async def unassign_chatter(ctx, member: discord.Member):
         await ctx.send(f"{member.display_name} has no model assignment.")
 
 @bot.command(name="modelstats")
+@commands.has_permissions(manage_messages=True)
 async def model_stats(ctx, *, model_name: str = None):
     """View revenue stats for a model. Usage: !modelstats Mia"""
     if not model_name:
@@ -1098,6 +1101,7 @@ async def give_strike(ctx, member: discord.Member, *, reason: str = "No reason p
         await log_ch.send(embed=embed)
 
 @bot.command(name="strikes")
+@commands.has_permissions(manage_messages=True)
 async def view_strikes(ctx, member: discord.Member = None):
     """View strikes for a chatter. Usage: !strikes @user"""
     if not member:
@@ -1144,6 +1148,7 @@ async def set_goal(ctx, amount: float):
     await ctx.send(embed=embed)
 
 @bot.command(name="goal")
+@commands.has_permissions(manage_messages=True)
 async def check_goal(ctx):
     """Check progress toward today's revenue goal."""
     overall_goal = get_overall_daily_goal(ctx.guild.id)
@@ -1239,6 +1244,7 @@ async def of_stats(ctx, member: discord.Member, cvr: float, response_time: str, 
 
 @bot.command(name="pay")
 @commands.has_permissions(manage_messages=True)
+@commands.has_permissions(manage_messages=True)
 async def pay(ctx):
     """Show weekly payout for all chatters. Usage: !pay"""
     HOURLY_RATE = 3.00
@@ -1300,6 +1306,7 @@ async def pay(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name="performance")
+@commands.has_permissions(manage_messages=True)
 async def performance(ctx):
     """Show current weekly performance ratings for all chatters."""
     if ctx.guild.id not in weekly_stats or not weekly_stats[ctx.guild.id]:
@@ -1346,6 +1353,7 @@ async def performance(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name="milestones")
+@commands.has_permissions(manage_messages=True)
 async def show_milestones(ctx):
     """Show revenue milestone progress for all models."""
     if ctx.guild.id not in models or not models[ctx.guild.id]:
@@ -1493,6 +1501,48 @@ async def active_sale(ctx):
         except:
             pass
 
+@bot.command(name="excuselate")
+@commands.has_permissions(manage_messages=True)
+async def excuse_late(ctx, member: discord.Member, *, reason: str = "Excused by manager"):
+    """Remove a late strike from a chatter and set their shift start to on time. Usage: !excuselate @user reason"""
+    s = get_strikes(ctx.guild.id, member.id)
+
+    # Remove the most recent late strike
+    late_strike = next((r for r in reversed(s["reasons"]) if "Late shift start" in r), None)
+    if late_strike:
+        s["reasons"].remove(late_strike)
+        s["count"] = max(0, s["count"] - 1)
+        removed = True
+    else:
+        removed = False
+
+    embed = discord.Embed(title=f"✅ Late Excused — {member.display_name}", color=0x00ff88)
+    if removed:
+        embed.add_field(name="Strike Removed", value=late_strike, inline=False)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Current Strikes", value=f"{s['count']}/3", inline=True)
+    else:
+        embed.add_field(name="Note", value="No late strike found to remove.", inline=False)
+    await ctx.send(embed=embed)
+
+    # DM the chatter
+    try:
+        await member.send(
+            f"✅ **Late Excused — Suvy Agency**\n"
+            f"Your late start has been excused by your manager.\n"
+            f"Reason: {reason}\n"
+            f"Current strikes: {s['count']}/3"
+        )
+    except:
+        pass
+
+    log_ch = await get_log_channel(ctx.guild)
+    if log_ch:
+        await log_ch.send(
+            f"✅ **{member.display_name}**'s late start excused by {ctx.author.display_name}. "
+            f"Reason: {reason} | Strikes: {s['count']}/3"
+        )
+
 @bot.command(name="addtoroster")
 @commands.has_permissions(manage_messages=True)
 async def add_to_roster(ctx, member: discord.Member, shift_key: str):
@@ -1522,6 +1572,7 @@ async def remove_from_roster(ctx, member: discord.Member, shift_key: str):
     await ctx.send(f"✅ {member.display_name} removed from {SHIFTS[shift_key]['name']} roster.")
 
 @bot.command(name="roster")
+@commands.has_permissions(manage_messages=True)
 async def show_roster(ctx):
     """Show the current shift roster."""
     embed = discord.Embed(title="📋 Shift Roster", color=0x5865F2)
@@ -1680,6 +1731,7 @@ async def reset_weekly(ctx):
     await ctx.send("✅ Weekly leaderboard has been reset.")
 
 @bot.command(name="shiftreport")
+@commands.has_permissions(manage_messages=True)
 async def shift_report(ctx, shift_key: str = None):
     """Show stats for a shift. Usage: !shiftreport night"""
     if not shift_key or shift_key not in SHIFTS:
@@ -1737,6 +1789,23 @@ async def help_cmd(ctx):
     embed.add_field(name="!resetstats [night/morning/day]", value="Reset stats for a shift (admin only)", inline=False)
     embed.add_field(name="─────────────────────────", value="**Chatter check-in format:**\n`PPV: 5 | Fans: 12 | Rev: $180`\nor just: `5 12 180`", inline=False)
     await ctx.send(embed=embed)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.message.delete()
+        try:
+            await ctx.author.send(
+                f"❌ You don't have permission to use that command.\n"
+                f"Your available commands are:\n"
+                f"`!startshift @YourName night/morning/day`\n"
+                f"`!endshift @YourName`\n"
+                f"`!activesale`"
+            )
+        except:
+            pass
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # Ignore unknown commands silently
 
 # ─── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
